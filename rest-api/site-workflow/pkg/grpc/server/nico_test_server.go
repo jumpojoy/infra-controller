@@ -28,7 +28,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
-	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/rs/zerolog/log"
 
@@ -46,6 +46,22 @@ var (
 	DefaultTenantKeysetId = "00000000-0000-4000-a000-000000000000"
 	// DefaultIBParitionId is the default IBPartition ID for testing
 	DefaultIBParitionId = "00000000-0000-4000-b000-000000000000"
+	// DefaultTenantOrganizationId is the default TenantOrganization ID for testing
+	DefaultTenantOrganizationId = "00000000-0000-4000-d000-000000000000"
+	// DefaultSkuId is the default Sku ID for testing
+	DefaultSkuId = "sku-dgx-h100-8x-default"
+	// DefaultVpcPeeringId is the default VpcPeering ID for testing
+	DefaultVpcPeeringId = "00000000-0000-4000-8001-000000000000"
+	// DefaultPeerVpcId is the peer VPC ID used by the default VpcPeering
+	DefaultPeerVpcId = "00000000-0000-4000-8002-000000000000"
+	// DefaultDpuExtensionServiceId is the default DpuExtensionService ID for testing
+	DefaultDpuExtensionServiceId = "00000000-0000-4000-8003-000000000000"
+	// DefaultNetworkSecurityGroupId is the default NetworkSecurityGroup ID for testing
+	DefaultNetworkSecurityGroupId = "00000000-0000-4000-8004-000000000000"
+	// DefaultVpcPrefixId is the default VpcPrefix ID for testing
+	DefaultVpcPrefixId = "00000000-0000-4000-e000-000000000001"
+	// DefaultVpcPrefixCIDR is the default CIDR for the seeded VpcPrefix
+	DefaultVpcPrefixCIDR = "10.0.0.0/16"
 )
 
 // NICoServerImpl implements interface NICoServer
@@ -61,6 +77,8 @@ type NICoServerImpl struct {
 	eps map[string]*cwssaws.ExpectedPowerShelf
 	es  map[string]*cwssaws.ExpectedSwitch
 	er  map[string]*cwssaws.ExpectedRack
+	tt  map[string]*cwssaws.Tenant
+	vp  map[string]*cwssaws.VpcPrefix
 
 	// Per-org machine identity state.
 	identityState    map[string]*identityOrgState
@@ -512,47 +530,466 @@ func (f *NICoServerImpl) FindMachinesByIds(ctx context.Context, req *cwssaws.Mac
 	return &response, nil
 }
 
-// The following stubs return empty results to keep the inventory Discover*
-// workflows quiet in local dev. The site-agent calls these on its 3-minute
-// inventory cron; without stubs they fail Unimplemented every cycle.
+// The following stubs serve the inventory Discover* workflows in local dev.
+// The site-agent calls these on its 3-minute inventory cron; they return
+// realistic fake data drawn from the in-memory state (or static defaults
+// where there is no backing map) so downstream workflows have something to
+// chew on instead of always seeing empty lists.
 func (f *NICoServerImpl) GetAllExpectedMachines(ctx context.Context, req *emptypb.Empty) (*cwssaws.ExpectedMachineList, error) {
-	return &cwssaws.ExpectedMachineList{}, nil
+	res := make([]*cwssaws.ExpectedMachine, 0, len(f.em))
+	for _, em := range f.em {
+		res = append(res, em)
+	}
+	return &cwssaws.ExpectedMachineList{ExpectedMachines: res}, nil
 }
 
 func (f *NICoServerImpl) FindInstanceTypeIds(ctx context.Context, req *cwssaws.FindInstanceTypeIdsRequest) (*cwssaws.FindInstanceTypeIdsResponse, error) {
-	return &cwssaws.FindInstanceTypeIdsResponse{}, nil
+	return &cwssaws.FindInstanceTypeIdsResponse{
+		InstanceTypeIds: []string{
+			"dgx-h100-8x",
+			"dgx-h100-4x",
+			"hgx-h100-8x",
+		},
+	}, nil
 }
 
 func (f *NICoServerImpl) FindNVLinkLogicalPartitionIds(ctx context.Context, req *cwssaws.NVLinkLogicalPartitionSearchFilter) (*cwssaws.NVLinkLogicalPartitionIdList, error) {
-	return &cwssaws.NVLinkLogicalPartitionIdList{}, nil
+	return &cwssaws.NVLinkLogicalPartitionIdList{
+		PartitionIds: []*cwssaws.NVLinkLogicalPartitionId{
+			{Value: "00000000-0000-4000-c000-000000000000"},
+		},
+	}, nil
 }
 
 func (f *NICoServerImpl) FindTenantOrganizationIds(ctx context.Context, req *cwssaws.TenantSearchFilter) (*cwssaws.TenantOrganizationIdList, error) {
-	return &cwssaws.TenantOrganizationIdList{}, nil
+	ids := []string{"00000000-0000-4000-d000-000000000000"}
+	for id := range f.tt {
+		if id == "00000000-0000-4000-d000-000000000000" {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return &cwssaws.TenantOrganizationIdList{TenantOrganizationIds: ids}, nil
+}
+
+func (f *NICoServerImpl) FindTenantsByOrganizationIds(ctx context.Context, req *cwssaws.TenantByOrganizationIdsRequest) (*cwssaws.TenantList, error) {
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	resp := &cwssaws.TenantList{}
+	for _, id := range req.OrganizationIds {
+		if t, ok := f.tt[id]; ok {
+			resp.Tenants = append(resp.Tenants, t)
+			continue
+		}
+		// Synthesize a Tenant for the well-known default so DiscoverTenantInventory
+		// has something to publish even before any explicit CreateTenant call.
+		resp.Tenants = append(resp.Tenants, &cwssaws.Tenant{OrganizationId: id})
+	}
+	return resp, nil
+}
+
+func (f *NICoServerImpl) CreateTenant(ctx context.Context, req *cwssaws.CreateTenantRequest) (*cwssaws.CreateTenantResponse, error) {
+	if req == nil || req.OrganizationId == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	t := &cwssaws.Tenant{
+		OrganizationId:     req.OrganizationId,
+		Metadata:           req.Metadata,
+		RoutingProfileType: req.RoutingProfileType,
+	}
+	f.tt[req.OrganizationId] = t
+	return &cwssaws.CreateTenantResponse{Tenant: t}, nil
+}
+
+func (f *NICoServerImpl) UpdateTenant(ctx context.Context, req *cwssaws.UpdateTenantRequest) (*cwssaws.UpdateTenantResponse, error) {
+	if req == nil || req.OrganizationId == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	t, ok := f.tt[req.OrganizationId]
+	if !ok {
+		t = &cwssaws.Tenant{OrganizationId: req.OrganizationId}
+		f.tt[req.OrganizationId] = t
+	}
+	if req.Metadata != nil {
+		t.Metadata = req.Metadata
+	}
+	if req.RoutingProfileType != nil {
+		t.RoutingProfileType = req.RoutingProfileType
+	}
+	return &cwssaws.UpdateTenantResponse{Tenant: t}, nil
+}
+
+// The Find{Sku,VpcPeering,DpuExtensionService,NetworkSecurityGroup}Ids /
+// Find*ByIds pairs back the corresponding inventory Discover workflows.
+// We synthesize a small set of plausible fake entities so downstream Cloud
+// workflows see a non-empty inventory page instead of hitting
+// "no fallback find function defined" on the Unimplemented default.
+
+func (f *NICoServerImpl) GetAllSkuIds(ctx context.Context, req *emptypb.Empty) (*cwssaws.SkuIdList, error) {
+	return &cwssaws.SkuIdList{Ids: []string{DefaultSkuId}}, nil
+}
+
+func (f *NICoServerImpl) FindSkusByIds(ctx context.Context, req *cwssaws.SkusByIdsRequest) (*cwssaws.SkuList, error) {
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	ids := req.Ids
+	if len(ids) == 0 {
+		ids = []string{DefaultSkuId}
+	}
+	res := make([]*cwssaws.Sku, 0, len(ids))
+	for _, id := range ids {
+		// Associate the SKU with whatever Machine LoadTestMachines created, so
+		// Sku → Machine references are internally consistent in the mock.
+		var assoc []*cwssaws.MachineId
+		for mid := range f.m {
+			assoc = append(assoc, &cwssaws.MachineId{Id: mid})
+			break
+		}
+		desc := "Mock SKU describing a DGX H100 8x reference platform"
+		deviceType := "dgx-h100-8x"
+		res = append(res, &cwssaws.Sku{
+			Id:                   id,
+			Description:          &desc,
+			Created:              timestamppb.Now(),
+			SchemaVersion:        1,
+			AssociatedMachineIds: assoc,
+			DeviceType:           &deviceType,
+		})
+	}
+	return &cwssaws.SkuList{Skus: res}, nil
+}
+
+func (f *NICoServerImpl) FindVpcPeeringIds(ctx context.Context, req *cwssaws.VpcPeeringSearchFilter) (*cwssaws.VpcPeeringIdList, error) {
+	return &cwssaws.VpcPeeringIdList{
+		VpcPeeringIds: []*cwssaws.VpcPeeringId{{Value: DefaultVpcPeeringId}},
+	}, nil
+}
+
+func (f *NICoServerImpl) FindVpcPeeringsByIds(ctx context.Context, req *cwssaws.VpcPeeringsByIdsRequest) (*cwssaws.VpcPeeringList, error) {
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	ids := req.VpcPeeringIds
+	if len(ids) == 0 {
+		ids = []*cwssaws.VpcPeeringId{{Value: DefaultVpcPeeringId}}
+	}
+	res := make([]*cwssaws.VpcPeering, 0, len(ids))
+	for _, id := range ids {
+		res = append(res, &cwssaws.VpcPeering{
+			Id:        id,
+			VpcId:     &cwssaws.VpcId{Value: DefaultVpcId},
+			PeerVpcId: &cwssaws.VpcId{Value: DefaultPeerVpcId},
+		})
+	}
+	return &cwssaws.VpcPeeringList{VpcPeerings: res}, nil
+}
+
+func (f *NICoServerImpl) FindDpuExtensionServiceIds(ctx context.Context, req *cwssaws.DpuExtensionServiceSearchFilter) (*cwssaws.DpuExtensionServiceIdList, error) {
+	return &cwssaws.DpuExtensionServiceIdList{ServiceIds: []string{DefaultDpuExtensionServiceId}}, nil
+}
+
+func (f *NICoServerImpl) FindDpuExtensionServicesByIds(ctx context.Context, req *cwssaws.DpuExtensionServicesByIdsRequest) (*cwssaws.DpuExtensionServiceList, error) {
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	ids := req.ServiceIds
+	if len(ids) == 0 {
+		ids = []string{DefaultDpuExtensionServiceId}
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	res := make([]*cwssaws.DpuExtensionService, 0, len(ids))
+	for _, id := range ids {
+		res = append(res, &cwssaws.DpuExtensionService{
+			ServiceId:            id,
+			ServiceType:          cwssaws.DpuExtensionServiceType_KUBERNETES_POD,
+			ServiceName:          "mock-dpu-extension-service",
+			TenantOrganizationId: DefaultTenantOrganizationId,
+			VersionCtr:           1,
+			ActiveVersions:       []string{"v1"},
+			Description:          "Mock DPU extension service for kind-reset",
+			Created:              now,
+			Updated:              now,
+		})
+	}
+	return &cwssaws.DpuExtensionServiceList{Services: res}, nil
+}
+
+func (f *NICoServerImpl) FindNetworkSecurityGroupIds(ctx context.Context, req *cwssaws.FindNetworkSecurityGroupIdsRequest) (*cwssaws.FindNetworkSecurityGroupIdsResponse, error) {
+	return &cwssaws.FindNetworkSecurityGroupIdsResponse{
+		NetworkSecurityGroupIds: []string{DefaultNetworkSecurityGroupId},
+	}, nil
+}
+
+func (f *NICoServerImpl) FindNetworkSecurityGroupsByIds(ctx context.Context, req *cwssaws.FindNetworkSecurityGroupsByIdsRequest) (*cwssaws.FindNetworkSecurityGroupsByIdsResponse, error) {
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	ids := req.NetworkSecurityGroupIds
+	if len(ids) == 0 {
+		ids = []string{DefaultNetworkSecurityGroupId}
+	}
+	tenantID := DefaultTenantOrganizationId
+	if req.TenantOrganizationId != nil && *req.TenantOrganizationId != "" {
+		tenantID = *req.TenantOrganizationId
+	}
+	res := make([]*cwssaws.NetworkSecurityGroup, 0, len(ids))
+	for _, id := range ids {
+		res = append(res, &cwssaws.NetworkSecurityGroup{
+			Id:                   id,
+			TenantOrganizationId: tenantID,
+			Version:              "1",
+		})
+	}
+	return &cwssaws.FindNetworkSecurityGroupsByIdsResponse{NetworkSecurityGroups: res}, nil
+}
+
+func newMockVpcPrefix(id, cidr, vpcId string) *cwssaws.VpcPrefix {
+	return &cwssaws.VpcPrefix{
+		Id:     &cwssaws.VpcPrefixId{Value: id},
+		VpcId:  &cwssaws.VpcId{Value: vpcId},
+		Config: &cwssaws.VpcPrefixConfig{Prefix: cidr},
+		Status: &cwssaws.VpcPrefixStatus{
+			Total_31Segments:         1024,
+			Available_31Segments:     1024,
+			TotalLinknetSegments:     256,
+			AvailableLinknetSegments: 256,
+		},
+	}
 }
 
 func (f *NICoServerImpl) GetVpcPrefixes(ctx context.Context, req *cwssaws.VpcPrefixGetRequest) (*cwssaws.VpcPrefixList, error) {
-	return &cwssaws.VpcPrefixList{}, nil
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	res := make([]*cwssaws.VpcPrefix, 0, len(req.VpcPrefixIds))
+	if len(req.VpcPrefixIds) == 0 {
+		// Return everything tracked, plus the seeded default so the inventory
+		// page is never empty before any explicit CreateVpcPrefix call.
+		seenDefault := false
+		for id, p := range f.vp {
+			res = append(res, p)
+			if id == DefaultVpcPrefixId {
+				seenDefault = true
+			}
+		}
+		if !seenDefault {
+			res = append(res, newMockVpcPrefix(DefaultVpcPrefixId, DefaultVpcPrefixCIDR, DefaultVpcId))
+		}
+		return &cwssaws.VpcPrefixList{VpcPrefixes: res}, nil
+	}
+	for _, id := range req.VpcPrefixIds {
+		if p, ok := f.vp[id.GetValue()]; ok {
+			res = append(res, p)
+			continue
+		}
+		// Synthesize a prefix for any unknown ID so the inventory loop stays
+		// consistent with whatever SearchVpcPrefixes reported.
+		res = append(res, newMockVpcPrefix(id.GetValue(), DefaultVpcPrefixCIDR, DefaultVpcId))
+	}
+	return &cwssaws.VpcPrefixList{VpcPrefixes: res}, nil
+}
+
+// SearchVpcPrefixes implements interface NICoServer. The filters in
+// VpcPrefixSearchQuery are ignored — the mock returns every tracked ID plus
+// the seeded default.
+func (f *NICoServerImpl) SearchVpcPrefixes(ctx context.Context, req *cwssaws.VpcPrefixSearchQuery) (*cwssaws.VpcPrefixIdList, error) {
+	ids := make([]*cwssaws.VpcPrefixId, 0, len(f.vp)+1)
+	seenDefault := false
+	for id := range f.vp {
+		ids = append(ids, &cwssaws.VpcPrefixId{Value: id})
+		if id == DefaultVpcPrefixId {
+			seenDefault = true
+		}
+	}
+	if !seenDefault {
+		ids = append(ids, &cwssaws.VpcPrefixId{Value: DefaultVpcPrefixId})
+	}
+	return &cwssaws.VpcPrefixIdList{VpcPrefixIds: ids}, nil
+}
+
+// CreateVpcPrefix implements interface NICoServer
+func (f *NICoServerImpl) CreateVpcPrefix(ctx context.Context, req *cwssaws.VpcPrefixCreationRequest) (*cwssaws.VpcPrefix, error) {
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	var nid string
+	switch {
+	case req.Id != nil && req.Id.Value != "":
+		nid = req.Id.Value
+	case f.vp[DefaultVpcPrefixId] == nil:
+		nid = DefaultVpcPrefixId
+	default:
+		nid = uuid.NewString()
+	}
+	if _, exists := f.vp[nid]; exists {
+		return nil, status.Errorf(codes.AlreadyExists, "VpcPrefix with ID %q already exists", nid)
+	}
+	cidr := DefaultVpcPrefixCIDR
+	if req.Config != nil && req.Config.Prefix != "" {
+		cidr = req.Config.Prefix
+	} else if req.Prefix != "" {
+		cidr = req.Prefix
+	}
+	vpcID := DefaultVpcId
+	if req.VpcId != nil && req.VpcId.Value != "" {
+		vpcID = req.VpcId.Value
+	}
+	p := newMockVpcPrefix(nid, cidr, vpcID)
+	p.Name = req.Name
+	p.Metadata = req.Metadata
+	f.vp[nid] = p
+	return p, nil
+}
+
+// UpdateVpcPrefix implements interface NICoServer
+func (f *NICoServerImpl) UpdateVpcPrefix(ctx context.Context, req *cwssaws.VpcPrefixUpdateRequest) (*cwssaws.VpcPrefix, error) {
+	if req == nil || req.Id == nil || req.Id.Value == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	p, ok := f.vp[req.Id.Value]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "VpcPrefix with ID %q not found", req.Id.Value)
+	}
+	if req.Config != nil && req.Config.Prefix != "" {
+		if p.Config == nil {
+			p.Config = &cwssaws.VpcPrefixConfig{}
+		}
+		p.Config.Prefix = req.Config.Prefix
+	} else if req.Prefix != nil && *req.Prefix != "" {
+		if p.Config == nil {
+			p.Config = &cwssaws.VpcPrefixConfig{}
+		}
+		p.Config.Prefix = *req.Prefix
+	}
+	if req.Name != nil {
+		p.Name = *req.Name
+	}
+	if req.Metadata != nil {
+		p.Metadata = req.Metadata
+	}
+	return p, nil
+}
+
+// DeleteVpcPrefix implements interface NICoServer
+func (f *NICoServerImpl) DeleteVpcPrefix(ctx context.Context, req *cwssaws.VpcPrefixDeletionRequest) (*cwssaws.VpcPrefixDeletionResult, error) {
+	if req == nil || req.Id == nil || req.Id.Value == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	if _, ok := f.vp[req.Id.Value]; !ok {
+		return nil, status.Errorf(codes.NotFound, "VpcPrefix with ID %q not found", req.Id.Value)
+	}
+	delete(f.vp, req.Id.Value)
+	return &cwssaws.VpcPrefixDeletionResult{}, nil
 }
 
 func (f *NICoServerImpl) ListOsImage(ctx context.Context, req *cwssaws.ListOsImageRequest) (*cwssaws.ListOsImageResponse, error) {
-	return &cwssaws.ListOsImageResponse{}, nil
+	ubuntuName := "ubuntu-22.04"
+	rockyName := "rockylinux-9"
+	return &cwssaws.ListOsImageResponse{
+		Images: []*cwssaws.OsImage{
+			{
+				Attributes: &cwssaws.OsImageAttributes{
+					Id:                   &cwssaws.UUID{Value: "00000000-0000-4000-f000-000000000001"},
+					SourceUrl:            "https://images.local/ubuntu-22.04.qcow2",
+					Digest:               "sha256:fakedigestubuntu",
+					TenantOrganizationId: "00000000-0000-4000-d000-000000000000",
+					Name:                 &ubuntuName,
+				},
+				Status: cwssaws.OsImageStatus_ImageReady,
+			},
+			{
+				Attributes: &cwssaws.OsImageAttributes{
+					Id:                   &cwssaws.UUID{Value: "00000000-0000-4000-f000-000000000002"},
+					SourceUrl:            "https://images.local/rockylinux-9.qcow2",
+					Digest:               "sha256:fakedigestrocky",
+					TenantOrganizationId: "00000000-0000-4000-d000-000000000000",
+					Name:                 &rockyName,
+				},
+				Status: cwssaws.OsImageStatus_ImageReady,
+			},
+		},
+	}, nil
 }
 
 func (f *NICoServerImpl) GetAllExpectedMachinesLinked(ctx context.Context, req *emptypb.Empty) (*cwssaws.LinkedExpectedMachineList, error) {
-	return &cwssaws.LinkedExpectedMachineList{}, nil
+	res := make([]*cwssaws.LinkedExpectedMachine, 0, len(f.em))
+	for _, em := range f.em {
+		linked := &cwssaws.LinkedExpectedMachine{
+			ChassisSerialNumber: em.ChassisSerialNumber,
+			BmcMacAddress:       em.BmcMacAddress,
+			ExpectedMachineId:   em.Id,
+		}
+		// Link to any known Machine so the discovery workflow can map
+		// BMC MAC → Core MachineId.
+		for mid := range f.m {
+			linked.MachineId = &cwssaws.MachineId{Id: mid}
+			break
+		}
+		res = append(res, linked)
+	}
+	return &cwssaws.LinkedExpectedMachineList{ExpectedMachines: res}, nil
 }
 
 func (f *NICoServerImpl) GetAllExpectedPowerShelvesLinked(ctx context.Context, req *emptypb.Empty) (*cwssaws.LinkedExpectedPowerShelfList, error) {
-	return &cwssaws.LinkedExpectedPowerShelfList{}, nil
+	res := make([]*cwssaws.LinkedExpectedPowerShelf, 0, len(f.eps))
+	for _, eps := range f.eps {
+		res = append(res, &cwssaws.LinkedExpectedPowerShelf{
+			ShelfSerialNumber:    eps.ShelfSerialNumber,
+			BmcMacAddress:        eps.BmcMacAddress,
+			ExpectedPowerShelfId: eps.ExpectedPowerShelfId,
+			PowerShelfId:         &cwssaws.PowerShelfId{Id: uuid.NewString()},
+		})
+	}
+	return &cwssaws.LinkedExpectedPowerShelfList{ExpectedPowerShelves: res}, nil
 }
 
 func (f *NICoServerImpl) GetAllExpectedSwitchesLinked(ctx context.Context, req *emptypb.Empty) (*cwssaws.LinkedExpectedSwitchList, error) {
-	return &cwssaws.LinkedExpectedSwitchList{}, nil
+	res := make([]*cwssaws.LinkedExpectedSwitch, 0, len(f.es))
+	for _, es := range f.es {
+		res = append(res, &cwssaws.LinkedExpectedSwitch{
+			SwitchSerialNumber: es.SwitchSerialNumber,
+			BmcMacAddress:      es.BmcMacAddress,
+			ExpectedSwitchId:   es.ExpectedSwitchId,
+			SwitchId:           &cwssaws.SwitchId{Id: uuid.NewString()},
+		})
+	}
+	return &cwssaws.LinkedExpectedSwitchList{ExpectedSwitches: res}, nil
 }
 
 func (f *NICoServerImpl) GetNetworkSecurityGroupPropagationStatus(ctx context.Context, req *cwssaws.GetNetworkSecurityGroupPropagationStatusRequest) (*cwssaws.GetNetworkSecurityGroupPropagationStatusResponse, error) {
-	return &cwssaws.GetNetworkSecurityGroupPropagationStatusResponse{}, nil
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	resp := &cwssaws.GetNetworkSecurityGroupPropagationStatusResponse{}
+
+	vpcIds := req.VpcIds
+	if len(vpcIds) == 0 {
+		for id := range f.v {
+			vpcIds = append(vpcIds, id)
+		}
+	}
+	for _, id := range vpcIds {
+		resp.Vpcs = append(resp.Vpcs, &cwssaws.NetworkSecurityGroupPropagationObjectStatus{
+			Id:     id,
+			Status: cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL,
+		})
+	}
+
+	instanceIds := req.InstanceIds
+	if len(instanceIds) == 0 {
+		for id := range f.ins {
+			instanceIds = append(instanceIds, id)
+		}
+	}
+	for _, id := range instanceIds {
+		resp.Instances = append(resp.Instances, &cwssaws.NetworkSecurityGroupPropagationObjectStatus{
+			Id:     id,
+			Status: cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL,
+		})
+	}
+	return resp, nil
 }
 
 func (f *NICoServerImpl) SetMaintenance(context.Context, *cwssaws.MaintenanceRequest) (*emptypb.Empty, error) {
@@ -2000,6 +2437,8 @@ func NICoTest(secs int) {
 		eps:              make(map[string]*cwssaws.ExpectedPowerShelf),
 		es:               make(map[string]*cwssaws.ExpectedSwitch),
 		er:               make(map[string]*cwssaws.ExpectedRack),
+		tt:               make(map[string]*cwssaws.Tenant),
+		vp:               make(map[string]*cwssaws.VpcPrefix),
 		identityState:    make(map[string]*identityOrgState),
 		tokenDelegations: make(map[string]*cwssaws.TokenDelegationResponse),
 	}
