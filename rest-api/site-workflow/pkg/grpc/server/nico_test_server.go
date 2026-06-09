@@ -79,6 +79,7 @@ type NICoServerImpl struct {
 	er  map[string]*cwssaws.ExpectedRack
 	tt  map[string]*cwssaws.Tenant
 	vp  map[string]*cwssaws.VpcPrefix
+	osi map[string]*cwssaws.OsImage
 
 	// Per-org machine identity state.
 	identityState    map[string]*identityOrgState
@@ -400,11 +401,22 @@ func (f *NICoServerImpl) AllocateInstance(ctx context.Context, req *cwssaws.Inst
 	if !ok {
 		ifcsts := []*cwssaws.InstanceInterfaceStatus{}
 		for _, ifcreq := range req.Config.Network.Interfaces {
+			addr := ifcreq.GetIpAddress()
+			if addr == "" {
+				if pid := ifcreq.GetVpcPrefixId(); pid != nil && pid.Value != "" {
+					if p, ok := f.vp[pid.Value]; ok && p.Config != nil && p.Config.Prefix != "" {
+						if a, err := generateIPAddressInCIDR(p.Config.Prefix); err == nil {
+							addr = a
+						}
+					}
+				}
+			}
+			if addr == "" {
+				addr = generateIPAddress()
+			}
 			ifcst := &cwssaws.InstanceInterfaceStatus{
 				MacAddress: getStrPtr(generateMacAddress()),
-				Addresses: []string{
-					generateIPAddress(),
-				},
+				Addresses:  []string{addr},
 			}
 			if ifcreq.FunctionType == cwssaws.InterfaceFunctionType_VIRTUAL_FUNCTION {
 				vfid := uint32(generateInteger(16))
@@ -472,7 +484,13 @@ func (f *NICoServerImpl) FindInstanceIds(ctx context.Context, req *cwssaws.Insta
 	return &response, nil
 }
 
-// FindInstances implements interface NICoServer
+// FindInstances implements interface NICoServer.
+//
+// The site-agent's inventory discovery cron is the only consumer that observes
+// instance state, so we advance the mocked lifecycle one step per read here
+// (PROVISIONING → CONFIGURING → READY). Real Core would advance state from
+// machine-controller signals; this mock has no machine-controller, so without
+// this nudge instances stay in PROVISIONING forever.
 func (f *NICoServerImpl) FindInstancesByIds(ctx context.Context, req *cwssaws.InstancesByIdsRequest) (*cwssaws.InstanceList, error) {
 	if req == nil {
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
@@ -480,6 +498,14 @@ func (f *NICoServerImpl) FindInstancesByIds(ctx context.Context, req *cwssaws.In
 	response := cwssaws.InstanceList{}
 	for _, id := range req.InstanceIds {
 		if obj, ok := f.ins[id.GetValue()]; ok {
+			if obj.Status != nil && obj.Status.Tenant != nil {
+				switch obj.Status.Tenant.State {
+				case cwssaws.TenantState_PROVISIONING:
+					obj.Status.Tenant.State = cwssaws.TenantState_CONFIGURING
+				case cwssaws.TenantState_CONFIGURING:
+					obj.Status.Tenant.State = cwssaws.TenantState_READY
+				}
+			}
 			response.Instances = append(response.Instances, obj)
 		}
 	}
@@ -908,32 +934,73 @@ func (f *NICoServerImpl) DeleteVpcPrefix(ctx context.Context, req *cwssaws.VpcPr
 }
 
 func (f *NICoServerImpl) ListOsImage(ctx context.Context, req *cwssaws.ListOsImageRequest) (*cwssaws.ListOsImageResponse, error) {
-	ubuntuName := "ubuntu-22.04"
-	rockyName := "rockylinux-9"
-	return &cwssaws.ListOsImageResponse{
-		Images: []*cwssaws.OsImage{
-			{
-				Attributes: &cwssaws.OsImageAttributes{
-					Id:                   &cwssaws.UUID{Value: "00000000-0000-4000-f000-000000000001"},
-					SourceUrl:            "https://images.local/ubuntu-22.04.qcow2",
-					Digest:               "sha256:fakedigestubuntu",
-					TenantOrganizationId: "00000000-0000-4000-d000-000000000000",
-					Name:                 &ubuntuName,
-				},
-				Status: cwssaws.OsImageStatus_ImageReady,
-			},
-			{
-				Attributes: &cwssaws.OsImageAttributes{
-					Id:                   &cwssaws.UUID{Value: "00000000-0000-4000-f000-000000000002"},
-					SourceUrl:            "https://images.local/rockylinux-9.qcow2",
-					Digest:               "sha256:fakedigestrocky",
-					TenantOrganizationId: "00000000-0000-4000-d000-000000000000",
-					Name:                 &rockyName,
-				},
-				Status: cwssaws.OsImageStatus_ImageReady,
-			},
-		},
-	}, nil
+	res := make([]*cwssaws.OsImage, 0, len(f.osi))
+	for _, img := range f.osi {
+		res = append(res, img)
+	}
+	return &cwssaws.ListOsImageResponse{Images: res}, nil
+}
+
+// CreateOsImage implements interface NICoServer. Stores the image with
+// ImageReady status so the next inventory discovery cycle reports it as
+// synced back up to the cloud DB.
+func (f *NICoServerImpl) CreateOsImage(ctx context.Context, req *cwssaws.OsImageAttributes) (*cwssaws.OsImage, error) {
+	if req == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	var nid string
+	if req.Id != nil && req.Id.Value != "" {
+		nid = req.Id.Value
+	} else {
+		nid = uuid.NewString()
+		req.Id = &cwssaws.UUID{Value: nid}
+	}
+	if _, exists := f.osi[nid]; exists {
+		return nil, status.Errorf(codes.AlreadyExists, "OsImage with ID %q already exists", nid)
+	}
+	img := &cwssaws.OsImage{
+		Attributes: req,
+		Status:     cwssaws.OsImageStatus_ImageReady,
+	}
+	f.osi[nid] = img
+	return img, nil
+}
+
+// UpdateOsImage implements interface NICoServer.
+func (f *NICoServerImpl) UpdateOsImage(ctx context.Context, req *cwssaws.OsImageAttributes) (*cwssaws.OsImage, error) {
+	if req == nil || req.Id == nil || req.Id.Value == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	img, ok := f.osi[req.Id.Value]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "OsImage with ID %q not found", req.Id.Value)
+	}
+	img.Attributes = req
+	return img, nil
+}
+
+// DeleteOsImage implements interface NICoServer.
+func (f *NICoServerImpl) DeleteOsImage(ctx context.Context, req *cwssaws.DeleteOsImageRequest) (*cwssaws.DeleteOsImageResponse, error) {
+	if req == nil || req.Id == nil || req.Id.Value == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	if _, ok := f.osi[req.Id.Value]; !ok {
+		return nil, status.Errorf(codes.NotFound, "OsImage with ID %q not found", req.Id.Value)
+	}
+	delete(f.osi, req.Id.Value)
+	return &cwssaws.DeleteOsImageResponse{}, nil
+}
+
+// GetOsImage implements interface NICoServer.
+func (f *NICoServerImpl) GetOsImage(ctx context.Context, req *cwssaws.UUID) (*cwssaws.OsImage, error) {
+	if req == nil || req.Value == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid request argument")
+	}
+	img, ok := f.osi[req.Value]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "OsImage with ID %q not found", req.Value)
+	}
+	return img, nil
 }
 
 func (f *NICoServerImpl) GetAllExpectedMachinesLinked(ctx context.Context, req *emptypb.Empty) (*cwssaws.LinkedExpectedMachineList, error) {
@@ -2364,6 +2431,7 @@ func NICoTest(secs int) {
 		er:               make(map[string]*cwssaws.ExpectedRack),
 		tt:               make(map[string]*cwssaws.Tenant),
 		vp:               make(map[string]*cwssaws.VpcPrefix),
+		osi:              make(map[string]*cwssaws.OsImage),
 		identityState:    make(map[string]*identityOrgState),
 		tokenDelegations: make(map[string]*cwssaws.TokenDelegationResponse),
 	}
